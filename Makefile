@@ -36,7 +36,7 @@ build:
 ifeq ($(TAGS),)
 	$(CGO_FLAGS) go build -o bin/go-ycsb cmd/go-ycsb/*
 else
-	$(CGO_FLAGS) go build -tags "$(TAGS)" -o bin/go-ycsb cmd/go-ycsb/*
+	$(CGO_FLAGS) go build -tags "$(TAGS)" -tags dynamic -o bin/go-ycsb cmd/go-ycsb/*
 endif
 
 check:
