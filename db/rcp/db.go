@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/magiconair/properties"
@@ -13,10 +14,22 @@ import (
 	"github.com/pingcap/go-ycsb/pkg/ycsb"
 )
 
+type Node struct {
+	ID       string `json:"id"`
+	HttpPort string `json:"http_port"`
+	IP       string `json:"ip"`
+}
+
+type Config struct {
+	Nodes []*Node `json:"nodes"`
+}
+
 type rcpDB struct {
-	httpClient http.Client
-	serverAddr string
-	fieldcount int64
+	httpClient        http.Client
+	serverAddr        string
+	fieldcount        int64
+	nodes             []*Node
+	contactServerLock sync.RWMutex
 }
 
 type GetValueResponse struct {
@@ -32,23 +45,53 @@ func init() {
 
 func (c rcpCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	rcp := &rcpDB{}
-	serverAddr, ok := p.Get("rcp.addr")
+	configStr, ok := p.Get("rcp.config")
 	if !ok {
-		return nil, fmt.Errorf("property 'rcp.addr' must be specified")
+		return nil, fmt.Errorf("property 'rcp.config' must be specified")
 	}
-	rcp.serverAddr = "http://" + serverAddr
+	var config Config
+	err := json.Unmarshal([]byte(configStr), &config)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshalling config: %v", err)
+	}
 
+	rcp.nodes = config.Nodes
 	client := http.Client{
 		Timeout: 10 * time.Second,
 	}
+	
+	rcp.changeContactServer("")
 
 	rcp.httpClient = client
 	rcp.fieldcount = p.GetInt64(prop.FieldCount, prop.FieldCountDefault)
 	return rcp, nil
 }
 
+func (db *rcpDB) changeContactServer(currentAddress string) {
+	db.contactServerLock.Lock()
+	defer db.contactServerLock.Unlock()
+
+	// check if contact address already changed
+	// while waiting for the lock
+	if currentAddress != "" && currentAddress != db.serverAddr {
+		return
+	}
+
+	for _, node := range db.nodes {
+		addr := "http://" + node.IP + node.HttpPort
+		if addr != db.serverAddr {
+			db.serverAddr = addr
+			fmt.Printf("Setting contact address: %s\n", db.serverAddr)
+			break
+		}
+	}
+}
+
 func (db *rcpDB) Delete(ctx context.Context, table string, key string) error {
-	reqURL := fmt.Sprintf("%s/del?key=%s", db.serverAddr, key)
+	db.contactServerLock.RLock()
+	addr := db.serverAddr
+	db.contactServerLock.RUnlock()
+	reqURL := fmt.Sprintf("%s/del?key=%s", addr, key)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, reqURL, nil)
 	if err != nil {
 		return err
@@ -59,10 +102,17 @@ func (db *rcpDB) Delete(ctx context.Context, table string, key string) error {
 	}
 	defer res.Body.Close()
 
-	if res.StatusCode != http.StatusOK {
+	if res.StatusCode == http.StatusOK {
+		return nil
+	}
+
+	if res.StatusCode == http.StatusExpectationFailed {
+		db.changeContactServer(addr)
+		// try again
+		return db.Delete(ctx, table, key)
+	} else {
 		return fmt.Errorf("bad status code: %d", res.StatusCode)
 	}
-	return nil
 }
 
 func (db *rcpDB) CleanupThread(ctx context.Context) {}
@@ -76,7 +126,6 @@ func (db *rcpDB) InitThread(ctx context.Context, threadID int, threadCount int) 
 }
 
 func (db *rcpDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
-	
 
 	valueStringMap := make(map[string]string)
 
@@ -85,7 +134,7 @@ func (db *rcpDB) Insert(ctx context.Context, table string, key string, values ma
 	}
 
 	return db.insertStringStringMap(ctx, key, table, valueStringMap)
-	
+
 }
 
 func (db *rcpDB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
@@ -129,7 +178,10 @@ func (db *rcpDB) Update(ctx context.Context, table string, key string, values ma
 }
 
 func (db *rcpDB) getFieldValueMap(ctx context.Context, key, table string) (map[string]string, error) {
-	baseURL := fmt.Sprintf("%s/get", db.serverAddr)
+	db.contactServerLock.RLock()
+	addr := db.serverAddr
+	db.contactServerLock.RUnlock()
+	baseURL := fmt.Sprintf("%s/get", addr)
 
 	params := url.Values{}
 	params.Add("key", key)
@@ -148,7 +200,11 @@ func (db *rcpDB) getFieldValueMap(ctx context.Context, key, table string) (map[s
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode == http.StatusExpectationFailed {
+		db.changeContactServer(addr)
+		// try again
+		return db.getFieldValueMap(ctx, key, table)
+	} else if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("bad status code: %d", resp.StatusCode)
 	}
 
@@ -170,7 +226,10 @@ func (db *rcpDB) getFieldValueMap(ctx context.Context, key, table string) (map[s
 }
 
 func (r *rcpDB) insertStringStringMap(ctx context.Context, key string, table string, valueStringMap map[string]string) error {
-	baseURL := fmt.Sprintf("%s/put", r.serverAddr)
+	r.contactServerLock.RLock()
+	addr := r.serverAddr
+	r.contactServerLock.RUnlock()
+	baseURL := fmt.Sprintf("%s/put", addr)
 	valueBytes, err := json.Marshal(valueStringMap)
 	if err != nil {
 		return err
@@ -195,7 +254,11 @@ func (r *rcpDB) insertStringStringMap(ctx context.Context, key string, table str
 
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode == http.StatusExpectationFailed {
+		r.changeContactServer(addr)
+		// try again
+		return r.insertStringStringMap(ctx, key, table, valueStringMap)
+	} else if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("bad status code: %d", resp.StatusCode)
 	}
 
